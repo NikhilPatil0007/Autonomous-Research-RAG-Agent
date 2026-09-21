@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+data/processed/*
+!data/processed/.gitkeep
+data/pdfs/**/*.pdf
+!data/pdfs/.gitkeep
+*.egg-info/
+logs/*.jsonl
+logs/*.jsonl.*
+!logs/.gitkeep

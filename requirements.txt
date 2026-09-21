@@ -1,0 +1,11 @@
+langgraph
+langchain
+langchain-google-genai
+langchain-core
+qdrant-client
+google-genai
+pymupdf
+python-dotenv
+pydantic
+pydantic-settings
+tiktoken
