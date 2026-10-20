@@ -8,6 +8,8 @@ data/processed/*
 data/pdfs/**/*.pdf
 !data/pdfs/.gitkeep
 *.egg-info/
+data/sessions/*.json
+!data/sessions/.gitkeep
 logs/*.jsonl
 logs/*.jsonl.*
 !logs/.gitkeep

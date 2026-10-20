@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     qdrant_collection: str = "research_documents"
 
     max_research_iterations: int = 3
+    max_concurrent_research: int = 2
 
     pdf_dir: Path = ROOT_DIR / "data" / "pdfs"
     processed_dir: Path = ROOT_DIR / "data" / "processed"

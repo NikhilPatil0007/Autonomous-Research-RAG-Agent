@@ -16,6 +16,39 @@ def _trace(state: ResearchState, name: str) -> list[str]:
     return list(state.get("trace") or []) + [name]
 
 
+def _history_text(state: ResearchState) -> str:
+    history = list(state.get("messages") or [])[-6:]
+    if not history:
+        return "(none)"
+    lines = []
+    for message in history:
+        role = message.get("role") or "unknown"
+        name = message.get("name")
+        label = f"{role}:{name}" if name else role
+        lines.append(f"{label}: {message.get('content') or ''}")
+    return "\n".join(lines)
+
+
+def _user_message(state: ResearchState) -> list[dict]:
+    question = state.get("question") or ""
+    history = state.get("messages") or []
+    if history and history[-1].get("role") == "user" and history[-1].get("content") == question:
+        return []
+    return [{"role": "user", "content": question}]
+
+
+def _tool_message(name: str, content: str) -> dict:
+    return {"role": "tool", "name": name, "content": content[:500]}
+
+
+def _hit_brief(rows: list[dict[str, Any]]) -> str:
+    parts = []
+    for row in rows[:8]:
+        title = row.get("title") or row.get("source") or "source"
+        parts.append(f"{title} p.{row.get('page')} ({row.get('chunk_id')})")
+    return "; ".join(parts) or "none"
+
+
 def _as_text(value: Any) -> str:
     """Gemini/LangChain may return content as str or a list of blocks."""
     if value is None:
@@ -86,12 +119,17 @@ class CriticOut(BaseModel):
 
 
 def planner(state: ResearchState) -> dict:
+    history_text = _history_text(state)
     with span("planner", component="generation", question=preview(state["question"])) as bag:
         out = invoke_structured(
             PlannerOut,
             "Decompose the user question into 2-4 focused search queries "
             "for a local research PDF corpus. Cover distinct facets "
-            "(e.g. RAG advantages, fine-tuning limits, when each is appropriate).\n\n"
+            "(e.g. RAG advantages, fine-tuning limits, when each is appropriate). "
+            "If the question is a follow-up, rewrite it into standalone search queries "
+            "using the recent user, tool, and assistant messages. "
+            "Do not search for pronouns alone.\n\n"
+            f"Recent conversation:\n{history_text}\n\n"
             f"Question: {state['question']}",
         )
         bag["n_queries"] = len(out.search_queries)
@@ -106,7 +144,11 @@ def planner(state: ResearchState) -> dict:
                 "queries": out.search_queries,
             },
         )
-        return {"search_queries": out.search_queries, "trace": _trace(state, "planner")}
+        return {
+            "search_queries": out.search_queries,
+            "messages": _user_message(state),
+            "trace": _trace(state, "planner"),
+        }
 
 
 def retriever(state: ResearchState) -> dict:
@@ -159,6 +201,12 @@ def retriever(state: ResearchState) -> dict:
             "retrieved_chunks": merged,
             "seen_chunk_ids": [_chunk_id(r) for r in merged],
             "iteration": int(state.get("iteration") or 0) + 1,
+            "messages": [
+                _tool_message(
+                    "retrieve_chunks",
+                    f"queries={queries} | new_hits={_hit_brief(new_rows)}",
+                )
+            ],
             "trace": _trace(state, "retriever"),
         }
 
@@ -210,7 +258,8 @@ def query_rewriter(state: ResearchState) -> dict:
         out = invoke_structured(
             RewriterOut,
             "Write 1-4 NEW search queries that target ONLY the evidence gaps. "
-            "Do not repeat prior queries.\n\n"
+            "Do not repeat prior queries. Use the conversation to keep the same topic.\n\n"
+            f"Recent conversation:\n{_history_text(state)}\n\n"
             f"Question: {state['question']}\n"
             f"Prior queries: {state.get('search_queries')}\n"
             f"Analyzer notes: {state.get('critic_notes')}",
@@ -259,7 +308,9 @@ def synthesizer(state: ResearchState) -> dict:
                 "Write a synthesis that answers the question using ONLY the evidence. "
                 "Cite with [n] markers that match the numbered evidence items. "
                 "Do not invent papers, titles, or page numbers. "
-                "If evidence is one-sided, say so.\n\n"
+                "If evidence is one-sided, say so. "
+                "Use the recent conversation to resolve follow-ups, not as a citation source.\n\n"
+                f"Recent conversation:\n{_history_text(state)}\n\n"
                 f"Question: {state['question']}\n\nEvidence:\n{_format_evidence(chunks)}"
             )
         draft = _as_text(getattr(msg, "content", None) or msg)
@@ -365,6 +416,13 @@ def researcher(state: ResearchState) -> dict:
             "seen_chunk_ids": [_chunk_id(r) for r in merged],
             "critic_retrieve_used": True,
             "researcher_document_id": "",
+            "messages": [
+                _tool_message(
+                    "researcher",
+                    f"query={queries[0] if queries else ''} | document_id={doc_id or '-'} | "
+                    f"new_hits={_hit_brief(extra)}",
+                )
+            ],
             "trace": _trace(state, "researcher"),
         }
 
@@ -391,5 +449,6 @@ def finalize(state: ResearchState) -> dict:
     )
     return {
         "final_answer": answer,
+        "messages": [{"role": "assistant", "content": draft[:500]}],
         "trace": _trace(state, "finalize"),
     }

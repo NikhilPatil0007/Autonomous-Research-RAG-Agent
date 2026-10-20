@@ -1,6 +1,6 @@
 """Structured logs + in-process spans.
 
-JSON lines are written to logs/agent.jsonl (Loki/Grafana later).
+JSON lines are written to logs/agent.jsonl.
 Each run has a trace_id; each span has span_id + parent_span_id + duration_ms.
 Do not log API keys or full PDF text.
 """

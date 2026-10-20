@@ -9,3 +9,8 @@ python-dotenv
 pydantic
 pydantic-settings
 tiktoken
+rank-bm25
+ragas
+datasets
+fastapi
+uvicorn

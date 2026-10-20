@@ -10,11 +10,14 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from collections.abc import Iterator
 from typing import Any
+
+from langgraph.checkpoint.memory import MemorySaver
 
 from app.config import get_settings
 from app.graph.state import ResearchState
-from app.graph.workflow import build_graph
+from app.graph.workflow import build_graph, load_thread_messages, save_thread_messages
 from app.observability import get_logger, preview, setup_logging, span, start_run
 from app.tools import QdrantUnavailable, ensure_qdrant, retrieve_chunks
 
@@ -34,10 +37,20 @@ def _initial_state(question: str) -> ResearchState:
         "critic_pass": False,
         "critic_notes": "",
         "seen_chunk_ids": [],
+        "messages": [],
         "trace": [],
         "critic_retrieve_used": False,
         "researcher_document_id": "",
     }
+
+
+def _apply_update(state: dict[str, Any], update: dict[str, Any]) -> None:
+    if "messages" in update:
+        state["messages"] = ((state.get("messages") or []) + list(update["messages"]))[-6:]
+        rest = {key: value for key, value in update.items() if key != "messages"}
+        state.update(rest)
+        return
+    state.update(update)
 
 
 def _apply_max_iterations(n: int | None) -> None:
@@ -51,6 +64,8 @@ def _apply_max_iterations(n: int | None) -> None:
 
 def _print_update(node: str, update: dict[str, Any]) -> None:
     print(f"\n--- {node} ---")
+    if node == "session":
+        print(f"thread: {update.get('thread_id')}  prior_messages: {update.get('prior_messages')}")
     if "search_queries" in update:
         queries = update["search_queries"] or []
         print("queries:")
@@ -65,8 +80,94 @@ def _print_update(node: str, update: dict[str, Any]) -> None:
         notes = update.get("critic_notes") or ""
         if notes:
             print(f"critic_notes: {notes}")
+    if "n_chunks" in update:
+        print(f"chunks: {update['n_chunks']}")
+    path = update.get("path") or update.get("trace")
+    if path:
+        print("path:", " -> ".join(path))
+
+
+def public_update(node: str, update: dict[str, Any]) -> dict[str, Any]:
+    """Fields a client can show while a run is still going."""
+    event: dict[str, Any] = {"node": node}
+    if "search_queries" in update:
+        event["search_queries"] = list(update["search_queries"] or [])
+    if "retrieved_chunks" in update:
+        event["n_chunks"] = len(update["retrieved_chunks"] or [])
+    if "iteration" in update:
+        event["iteration"] = update["iteration"]
+    if "needs_more_research" in update:
+        event["needs_more_research"] = bool(update["needs_more_research"])
+    if "critic_pass" in update:
+        event["critic_pass"] = bool(update["critic_pass"])
+        event["critic_notes"] = update.get("critic_notes") or ""
+    if "final_answer" in update:
+        event["final_answer"] = update.get("final_answer") or ""
     if "trace" in update:
-        print("path:", " -> ".join(update["trace"]))
+        event["path"] = list(update["trace"] or [])
+    return event
+
+
+def iter_research(question: str, thread_id: str = "default") -> Iterator[dict[str, Any]]:
+    """Run one research question and yield a public event after each node."""
+    prior = load_thread_messages(thread_id)
+    graph = build_graph(MemorySaver())
+    config = {"configurable": {"thread_id": thread_id}}
+    state: dict[str, Any] = dict(_initial_state(question))
+    state["messages"] = prior
+    yield {
+        "node": "session",
+        "thread_id": thread_id,
+        "prior_messages": len(prior),
+    }
+    start_run(
+        kind="research",
+        question=preview(question),
+        max_iterations=get_settings().max_research_iterations,
+        thread_id=thread_id,
+    )
+    with span("graph.run", component="graph", question=preview(question)) as bag:
+        try:
+            for event in graph.stream(state, config, stream_mode="updates"):
+                for node, update in event.items():
+                    if not isinstance(update, dict):
+                        continue
+                    _apply_update(state, update)
+                    log.info(
+                        "graph.node.update",
+                        extra={
+                            "component": "graph",
+                            "event": "graph.node.update",
+                            "node": node,
+                            "path": state.get("trace"),
+                        },
+                    )
+                    yield public_update(node, update)
+        except Exception:
+            log.exception(
+                "graph.run.fail",
+                extra={
+                    "component": "graph",
+                    "event": "graph.run.fail",
+                    "path": state.get("trace"),
+                    "iteration": state.get("iteration"),
+                },
+            )
+            raise
+        bag["path"] = state.get("trace")
+        bag["iteration"] = state.get("iteration")
+        bag["critic_pass"] = state.get("critic_pass")
+        bag["n_evidence"] = len(state.get("evidence") or [])
+    snapshot = graph.get_state(config)
+    if snapshot.values.get("messages"):
+        state["messages"] = list(snapshot.values["messages"])[-6:]
+    save_thread_messages(thread_id, state.get("messages") or [])
+    yield {
+        "node": "done",
+        "path": list(state.get("trace") or []),
+        "final_answer": state.get("final_answer") or state.get("draft_answer") or "",
+        "messages": list(state.get("messages") or []),
+    }
 
 
 def dry_run_retrieve(query: str, k: int) -> None:
@@ -95,53 +196,29 @@ def dry_run_retrieve(query: str, k: int) -> None:
         print(f"    {text_preview}\n")
 
 
-def run_research(question: str) -> dict[str, Any]:
-    graph = build_graph()
-    state: dict[str, Any] = dict(_initial_state(question))
+def run_research(question: str, thread_id: str = "default") -> dict[str, Any]:
+    prior = load_thread_messages(thread_id)
     print(f"Question: {question}")
+    print(f"thread: {thread_id}  prior_messages: {len(prior)}")
     print(f"max retrieve/rewrite loops: {get_settings().max_research_iterations}")
-    start_run(
-        kind="research",
-        question=preview(question),
-        max_iterations=get_settings().max_research_iterations,
-    )
-    with span("graph.run", component="graph", question=preview(question)) as bag:
-        try:
-            for event in graph.stream(state, stream_mode="updates"):
-                for node, update in event.items():
-                    if not isinstance(update, dict):
-                        continue
-                    _print_update(node, update)
-                    state.update(update)
-                    log.info(
-                        "graph.node.update",
-                        extra={
-                            "component": "graph",
-                            "event": "graph.node.update",
-                            "node": node,
-                            "path": state.get("trace"),
-                        },
-                    )
-        except Exception:
-            log.exception(
-                "graph.run.fail",
-                extra={
-                    "component": "graph",
-                    "event": "graph.run.fail",
-                    "path": state.get("trace"),
-                    "iteration": state.get("iteration"),
-                },
-            )
-            raise
-        bag["path"] = state.get("trace")
-        bag["iteration"] = state.get("iteration")
-        bag["critic_pass"] = state.get("critic_pass")
-        bag["n_evidence"] = len(state.get("evidence") or [])
+    final: dict[str, Any] = {}
+    for event in iter_research(question, thread_id=thread_id):
+        if event.get("node") == "done":
+            final = event
+            continue
+        _print_update(str(event["node"]), event)
+    messages = final.get("messages") or []
+    print("\n========== memory ==========")
+    for message in messages:
+        label = message.get("role") or "?"
+        if message.get("name"):
+            label = f"{label}:{message['name']}"
+        print(f"{label}: {message.get('content')}")
     print("\n========== path ==========")
-    print(" -> ".join(state.get("trace") or []))
+    print(" -> ".join(final.get("path") or []))
     print("\n========== answer ==========\n")
-    print(state.get("final_answer") or state.get("draft_answer") or "(no answer)")
-    return state
+    print(final.get("final_answer") or "(no answer)")
+    return final
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -160,6 +237,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("-k", type=int, default=5, help="Top-k for --dry-run-retrieve")
     parser.add_argument("--log-level", default=None, help="DEBUG, INFO, WARNING (default: LOG_LEVEL)")
+    parser.add_argument(
+        "--thread",
+        default="default",
+        help="Short-memory thread id. The next question on this thread sees the last 6 messages.",
+    )
     args = parser.parse_args(argv)
 
     _apply_max_iterations(args.max_iterations)
@@ -185,7 +267,7 @@ def main(argv: list[str] | None = None) -> None:
         return
     if not args.question:
         parser.error("question is required unless --dry-run-retrieve is set")
-    run_research(args.question)
+    run_research(args.question, thread_id=args.thread)
 
 
 if __name__ == "__main__":
